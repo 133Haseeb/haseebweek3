@@ -1,6 +1,7 @@
 import os
 import re
 from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -19,11 +20,32 @@ os.makedirs(DB_DIR, exist_ok=True)
 # Using local HuggingFace embeddings (runs on CPU for free!)
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
+# Main LLM - used for the final, important answer
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-120b",
     temperature=0,
     api_key=os.getenv("GROQ_API_KEY")
 )
+
+# Smaller/faster LLM - used for cheap repetitive "mini-summary" work (Bug 2)
+fast_llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0,
+    api_key=os.getenv("GROQ_API_KEY")
+)
+
+
+# Keywords that suggest the user wants a WHOLE-BOOK answer, not a specific detail
+GLOBAL_KEYWORDS = [
+    "summarize", "summary", "entire book", "whole book", "overall",
+    "whole novel", "entire novel", "main theme", "best problem",
+    "all chapters", "complete book", "throughout the book", "in general"
+]
+
+
+def is_global_question(user_message: str) -> bool:
+    msg = user_message.lower()
+    return any(keyword in msg for keyword in GLOBAL_KEYWORDS)
 
 
 def process_and_store_document(file_path: str, book_type: str = "coding") -> str:
@@ -31,11 +53,13 @@ def process_and_store_document(file_path: str, book_type: str = "coding") -> str
     Processes the uploaded file based on the book_type and stores it in ChromaDB.
     """
     if book_type == "manga":
-        pass  # We'll fix this in Bug 4
+      #implement manga logic bug 4
 
-    # 1. Load the PDF with PyMuPDF
-    loader = PyMuPDFLoader(file_path)
-    docs = loader.load()
+    # Number every line on every page (needed for "page X line Y" questions)
+    for doc in docs:
+        lines = doc.page_content.split("\n")
+        numbered_lines = [f"Line {i + 1}: {line}" for i, line in enumerate(lines)]
+        doc.page_content = "\n".join(numbered_lines)
 
     # 2. Chunk the text
     text_splitter = RecursiveCharacterTextSplitter(
@@ -45,47 +69,114 @@ def process_and_store_document(file_path: str, book_type: str = "coding") -> str
     )
     chunks = text_splitter.split_documents(docs)
 
-    # --- BUG 1 FIX: Stamp the page number into every chunk's actual text ---
-    # PyMuPDFLoader stores the page number in chunk.metadata["page"], starting at 0.
-    # We add 1 so it matches what a human sees in a PDF viewer (page 1, not page 0).
+    # Stamp the page number into every chunk's actual text
     for chunk in chunks:
         page_number = chunk.metadata.get("page", 0) + 1
         chunk.page_content = f"[Source: PDF Viewer Page {page_number}]\n{chunk.page_content}"
-    # -------------------------------------------------------------------------
+
+    # Give each book_type its own isolated collection so books don't mix together
+    try:
+        old_db = Chroma(
+            persist_directory=DB_DIR,
+            embedding_function=embeddings,
+            collection_name=book_type
+        )
+        old_db.delete_collection()
+    except Exception:
+        pass
 
     # 3. Store in Vector DB
     vector_db = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        persist_directory=DB_DIR
+        persist_directory=DB_DIR,
+        collection_name=book_type
     )
     return "Success"
 
-def query_rag_system(user_message: str, book_type: str = "coding") -> str:
+
+def query_rag_system(user_message: str, book_type: str = "coding", chat_history: list = None) -> str:
     """
     Queries the Vector DB and generates an answer using the LLM.
     """
+    
     if llm is None:
         return "ERROR: You must initialize an LLM in rag_engine.py first!"
 
     vector_db = Chroma(
         persist_directory=DB_DIR,
-        embedding_function=embeddings
+        embedding_function=embeddings,
+        collection_name=book_type
     )
 
+    page_match = re.search(r"page\s+(\d+)", user_message.lower())
 
+    if page_match:
+        # Exact page lookup via metadata filter (Bug 1)
+        target_page_display = int(page_match.group(1))
+        target_page_metadata = target_page_display - 1
+        results = vector_db.get(where={"page": target_page_metadata})
+        context = "\n\n".join(results["documents"]) if results and results["documents"] else "No content found for this page."
 
-    # INTERN CHALLENGE 2: Myopic Context Limits
-    # The retriever only pulls 30 chunks. It cannot read a whole book!
-    # How can you route Global questions differently so your LLM can read massive sections at once?
+    elif is_global_question(user_message):
+        # Map-Reduce for whole-book questions, with token-budget cap (Bug 2)
+        all_data = vector_db.get()
+        all_docs = all_data["documents"]
 
-    retriever = vector_db.as_retriever(
-        search_kwargs={"k": 30}
-    )
+        batch_size = 40
+        max_batches = 8
 
-    # Build the Prompt
-    template = """You are a helpful Interactive Study Tutor. Answer the question based ONLY on the following context from the textbook.
-If the context does not contain the answer, say "I cannot find the answer to this in the textbook." Do not hallucinate or guess.
+        batches = [all_docs[i:i + batch_size] for i in range(0, len(all_docs), batch_size)]
+
+        if len(batches) > max_batches:
+            step = len(batches) / max_batches
+            batches = [batches[int(i * step)] for i in range(max_batches)]
+
+        summary_prompt = ChatPromptTemplate.from_template(
+            "Summarize the key points of the following textbook excerpt in 3-5 sentences:\n\n{text}"
+        )
+        summary_chain = summary_prompt | fast_llm | StrOutputParser()
+
+        mini_summaries = []
+        try:
+            for batch in batches:
+                batch_text = "\n\n".join(batch)
+                mini_summaries.append(summary_chain.invoke({"text": batch_text}))
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                return ("The AI hit Groq's free-tier rate limit while reading this large book. "
+                        "Try again in a couple of minutes, or ask about a smaller section instead.")
+            raise
+
+        context = "\n\n".join(mini_summaries)
+
+    else:
+        # Normal semantic search for everything else
+        # Lowered from 30 -> 8 chunks to stay comfortably under the free-tier
+        # tokens-per-minute (TPM) limit, especially with chat history included.
+        retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+        docs = retriever.invoke(user_message)
+        context = "\n\n".join(doc.page_content for doc in docs)
+
+    # Turn the chat_history list into readable text like "User: ...\nAssistant: ..."
+    if chat_history:
+        history_lines = [f"{turn['role'].capitalize()}: {turn['content']}" for turn in chat_history]
+        history_text = "\n".join(history_lines)
+    else:
+        history_text = "No previous conversation."
+
+    template = """You are a helpful Interactive Study Tutor.
+
+You have two sources of information:
+1. Conversation History - what has been said so far in this chat.
+2. Context - excerpts from the textbook.
+
+RULES:
+- If the question is about the TEXTBOOK CONTENT (facts, explanations, definitions, page numbers, etc.), answer ONLY using the Context below. If the Context does not contain the answer, say "I cannot find the answer to this in the textbook." Do not hallucinate or guess.
+- If the question is about the CONVERSATION ITSELF (e.g. "what did I just ask", "what did you say before", "repeat that"), answer using the Conversation History instead, even if it's not in the Context.
+
+Conversation History:
+{history}
 
 Context: {context}
 
@@ -95,20 +186,10 @@ Answer:"""
 
     prompt = ChatPromptTemplate.from_template(template)
 
-    # Format retrieved documents
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-
-    # Create the RAG Chain
     rag_chain = (
-        {
-            "context": retriever | format_docs,
-            "question": RunnablePassthrough()
-        }
-        | prompt
+        prompt
         | llm
         | StrOutputParser()
     )
 
-    # Generate answer
-    return rag_chain.invoke(user_message)
+    return rag_chain.invoke({"context": context, "question": user_message, "history": history_text})
