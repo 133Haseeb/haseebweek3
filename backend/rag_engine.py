@@ -109,7 +109,7 @@ def query_rag_system(user_message: str, book_type: str = "coding", chat_history:
         collection_name=book_type
     )
 
-    page_match = re.search(r"page\s+(\d+)", user_message.lower())
+      page_match = re.search(r"page\s+(\d+)", user_message.lower())
 
     if page_match:
         # Exact page lookup via metadata filter (Bug 1)
@@ -123,8 +123,8 @@ def query_rag_system(user_message: str, book_type: str = "coding", chat_history:
         all_data = vector_db.get()
         all_docs = all_data["documents"]
 
-        batch_size = 40
-        max_batches = 8
+        batch_size = 10          # smaller batches = fewer tokens per single call
+        max_batches = 6          # slightly fewer batches = less total work
 
         batches = [all_docs[i:i + batch_size] for i in range(0, len(all_docs), batch_size)]
 
@@ -137,11 +137,13 @@ def query_rag_system(user_message: str, book_type: str = "coding", chat_history:
         )
         summary_chain = summary_prompt | fast_llm | StrOutputParser()
 
+
         mini_summaries = []
         try:
             for batch in batches:
                 batch_text = "\n\n".join(batch)
                 mini_summaries.append(summary_chain.invoke({"text": batch_text}))
+                time.sleep(3)  # small pause so we don't burst past the per-minute token limit
         except Exception as e:
             if "rate_limit" in str(e).lower() or "429" in str(e):
                 return ("The AI hit Groq's free-tier rate limit while reading this large book. "
@@ -151,11 +153,22 @@ def query_rag_system(user_message: str, book_type: str = "coding", chat_history:
         context = "\n\n".join(mini_summaries)
 
     else:
-        # Normal semantic search for everything else
-        # Lowered from 30 -> 8 chunks to stay comfortably under the free-tier
-        # tokens-per-minute (TPM) limit, especially with chat history included.
-        retriever = vector_db.as_retriever(search_kwargs={"k": 8})
-        docs = retriever.invoke(user_message)
+        # Build a smarter search query: blend the current question with the
+        # user's last question, so vague follow-ups like "tell me more about
+        # that" or "what page is that from?" still find the right content.
+        search_query = user_message
+        if chat_history:
+            previous_user_messages = [turn["content"] for turn in chat_history if turn["role"] == "user"]
+            if previous_user_messages:
+                search_query = f"{previous_user_messages[-1]} {user_message}"
+
+        # Manga uses a higher k because the book is large (200+ pages) and
+        # OCR text is noisier, so we need to search a wider net to find the
+        # right page. Coding/Novel stay lower to protect the token budget.
+        k_value = 12 if book_type == "manga" else 8
+
+        retriever = vector_db.as_retriever(search_kwargs={"k": k_value})
+        docs = retriever.invoke(search_query)
         context = "\n\n".join(doc.page_content for doc in docs)
 
     # Turn the chat_history list into readable text like "User: ...\nAssistant: ..."
@@ -169,11 +182,12 @@ def query_rag_system(user_message: str, book_type: str = "coding", chat_history:
 
 You have two sources of information:
 1. Conversation History - what has been said so far in this chat.
-2. Context - excerpts from the textbook.
+2. Context - excerpts from the textbook. Each excerpt starts with a tag like "[Source: PDF Viewer Page X]" showing exactly where it came from.
 
 RULES:
 - If the question is about the TEXTBOOK CONTENT (facts, explanations, definitions, page numbers, etc.), answer ONLY using the Context below. If the Context does not contain the answer, say "I cannot find the answer to this in the textbook." Do not hallucinate or guess.
-- If the question is about the CONVERSATION ITSELF (e.g. "what did I just ask", "what did you say before", "repeat that"), answer using the Conversation History instead, even if it's not in the Context.
+- Whenever you answer using the Context, always mention the page number it came from, using the "[Source: PDF Viewer Page X]" tag in that excerpt. For example: "Lists are sequences of values (Page 34)."
+- If the question is about the CONVERSATION ITSELF (e.g. "what did I just ask", "where was that written", "what page was that on", "repeat that"), answer using the Conversation History instead, even if it's not in the Context — since a page number you already mentioned earlier is now part of the history.
 
 Conversation History:
 {history}
