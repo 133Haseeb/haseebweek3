@@ -25,9 +25,9 @@ const defaultWelcome = `
 `;
 
 const modeStates = {
-    coding: { chatHtml: defaultWelcome, successMsg: '' },
-    novel: { chatHtml: defaultWelcome, successMsg: '' },
-    manga: { chatHtml: defaultWelcome, successMsg: '' }
+    coding: { chatHtml: defaultWelcome, successMsg: '', chatHistory: [] },
+    novel: { chatHtml: defaultWelcome, successMsg: '', chatHistory: [] },
+    manga: { chatHtml: defaultWelcome, successMsg: '', chatHistory: [] }
 };
 
 // Function to switch modes
@@ -202,16 +202,17 @@ async function sendMessage() {
     chatBox.appendChild(loadingDiv);
     chatBox.scrollTop = chatBox.scrollHeight;
 
-    try {
+   try {
         const response = await fetch(`${API_BASE}/api/chat`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            // INTERN CHALLENGE 3: Amnesia
-            // Right now we only send the current message.
-            // How can you keep track of `chatHistory` and send it to the backend?
-            body: JSON.stringify({ message: text, book_type: currentMode })
+            body: JSON.stringify({
+                message: text,
+                book_type: currentMode,
+                history: modeStates[currentMode].chatHistory
+            })
         });
 
         const data = await response.json();
@@ -219,10 +220,20 @@ async function sendMessage() {
         // Remove loading
         document.getElementById(loadingId).remove();
 
-        if (data.error) {
+       if (data.error) {
             addMessage("❌ Error: " + data.error);
         } else {
             addMessage(data.answer);
+            // Save this exchange into memory for this mode
+            modeStates[currentMode].chatHistory.push({ role: "user", content: text });
+            modeStates[currentMode].chatHistory.push({ role: "assistant", content: data.answer });
+
+            // Only remember the last 2 exchanges (4 messages) so history
+            // doesn't grow forever and blow past the token limit.
+            const maxHistoryEntries = 4;
+            if (modeStates[currentMode].chatHistory.length > maxHistoryEntries) {
+                modeStates[currentMode].chatHistory = modeStates[currentMode].chatHistory.slice(-maxHistoryEntries);
+            }
         }
     } catch (error) {
         document.getElementById(loadingId).remove();
