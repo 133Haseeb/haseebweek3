@@ -25,6 +25,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 class ChatRequest(BaseModel):
     message: str
     book_type: str = "coding"
+    history: list = []
 
 @app.post("/api/upload")
 async def upload_document(
@@ -58,7 +59,7 @@ async def chat_endpoint(request: ChatRequest):
     """
     try:
         # Pass the book_type into the RAG engine
-        answer = query_rag_system(request.message, request.book_type)
+        answer = query_rag_system(request.message, request.book_type, request.history)
         return {"answer": answer}
     except Exception as e:
         return {"error": f"Failed to query system: {str(e)}"}
