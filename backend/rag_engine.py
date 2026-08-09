@@ -1,6 +1,12 @@
 import os
 import re
+import time 
 from langchain_community.document_loaders import PyMuPDFLoader
+import io
+import fitz  # this is PyMuPDF's actual import name
+import easyocr
+import numpy as np
+from PIL import Image
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -34,7 +40,61 @@ fast_llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
+# --- Bug 4: Manga OCR setup ---
 
+# Loading the OCR engine takes a few seconds, so we only load it ONCE,
+# and only if someone actually uploads a manga (not every time the app starts).
+_ocr_reader = None
+
+def get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        print("Loading OCR engine for the first time... this may take a moment.")
+        _ocr_reader = easyocr.Reader(['en'], gpu=False)
+    return _ocr_reader
+
+
+def extract_text_from_manga(file_path: str) -> list:
+    """
+    Manga/comics are basically pictures of text, so a normal PDF text-reader
+    can't see anything. Instead, we turn each page into an image (like taking
+    a screenshot of it), then use OCR to 'read' the dialogue out of the picture.
+    Returns a list of Documents, just like PyMuPDFLoader normally would.
+    """
+    reader = get_ocr_reader()
+    pdf = fitz.open(file_path)
+    docs = []
+
+    total_pages = len(pdf)
+    
+    test_limit = None
+    pages_to_process = min(total_pages, test_limit) if test_limit else total_pages
+
+    print(f"Starting OCR on {pages_to_process}/{total_pages} manga pages... this will take a while on CPU.")
+
+    for page_number in range(pages_to_process):
+        page = pdf[page_number]
+        print(f"OCR processing page {page_number + 1}/{pages_to_process}...")
+
+        # Render this PDF page as an image
+        pix = page.get_pixmap(dpi=100)
+        img_bytes = pix.tobytes("png")
+        image = Image.open(io.BytesIO(img_bytes))
+        image_np = np.array(image)
+
+        # Ask OCR to read all the text it can find in the image
+        results = reader.readtext(image_np, detail=0)  # detail=0 = just give plain text
+        page_text = "\n".join(results)
+
+        if not page_text.strip():
+            page_text = "[No readable text detected on this page]"
+
+        docs.append(Document(
+            page_content=page_text,
+            metadata={"page": page_number, "source": file_path}
+        ))
+
+    return docs
 # Keywords that suggest the user wants a WHOLE-BOOK answer, not a specific detail
 GLOBAL_KEYWORDS = [
     "summarize", "summary", "entire book", "whole book", "overall",
@@ -53,7 +113,12 @@ def process_and_store_document(file_path: str, book_type: str = "coding") -> str
     Processes the uploaded file based on the book_type and stores it in ChromaDB.
     """
     if book_type == "manga":
-      #implement manga logic bug 4
+        # Manga pages are images, so we OCR them instead of reading a text layer
+        docs = extract_text_from_manga(file_path)
+    else:
+        # 1. Load the PDF with PyMuPDF (normal text-based books)
+        loader = PyMuPDFLoader(file_path)
+        docs = loader.load()
 
     # Number every line on every page (needed for "page X line Y" questions)
     for doc in docs:
@@ -109,7 +174,7 @@ def query_rag_system(user_message: str, book_type: str = "coding", chat_history:
         collection_name=book_type
     )
 
-      page_match = re.search(r"page\s+(\d+)", user_message.lower())
+    page_match = re.search(r"page\s+(\d+)", user_message.lower())
 
     if page_match:
         # Exact page lookup via metadata filter (Bug 1)
